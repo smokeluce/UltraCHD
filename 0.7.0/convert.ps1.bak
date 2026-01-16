@@ -1,0 +1,388 @@
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+
+Set-Location -Path $PSScriptRoot
+$Chdman = Join-Path $PSScriptRoot "chdman.exe"
+
+# Create quarantine folder for bad archives
+$FailedDir = Join-Path $PSScriptRoot "FailedArchives"
+if (-not (Test-Path $FailedDir)) {
+    New-Item -ItemType Directory -Path $FailedDir | Out-Null
+}
+
+# ============================================
+# CHD Conversion & Repair Tool (Final Version)
+# Systems: PS1, PS2CD, PS2DVD, PSP, Dreamcast, 3DO
+# Handles: .iso, .bin/.cue, .gdi, .chd
+# ============================================
+
+function Extract-Archive {
+    param(
+        [string]$ArchivePath,
+        [string]$OutputDir
+    )
+
+    $ext = [System.IO.Path]::GetExtension($ArchivePath).ToLower()
+
+    if ($ext -eq ".zip") {
+        Write-Host "[ARC] Extracting ZIP..." -ForegroundColor Yellow
+        Expand-Archive -LiteralPath $ArchivePath -DestinationPath $OutputDir -Force
+        Write-Host "[ARC] Extraction complete." -ForegroundColor Green
+        return $true
+    }
+
+    if ($ext -in ".7z", ".rar") {
+        Write-Host "[ARC] Extracting $ext..." -ForegroundColor Yellow
+
+        $SevenZip = Join-Path $PSScriptRoot "7za.exe"
+        & $SevenZip x "$ArchivePath" -o"$OutputDir" -y
+
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[ERR] Extraction failed (7z exit code $LASTEXITCODE)" -ForegroundColor Red
+            return $false
+        }
+
+        Write-Host "[ARC] Extraction complete." -ForegroundColor Green
+        return $true
+    }
+
+    return $false
+}
+
+function Find-ExtractedGameFile {
+    param([string]$TempDir)
+
+    $iso = Get-ChildItem -Path $TempDir -Recurse -File -Filter *.iso | Select-Object -First 1
+    if ($iso) { return $iso.FullName }
+
+    $cue = Get-ChildItem -Path $TempDir -Recurse -File -Filter *.cue | Select-Object -First 1
+    if ($cue) { return $cue.FullName }
+
+    $bin = Get-ChildItem -Path $TempDir -Recurse -File -Filter *.bin | Select-Object -First 1
+    if ($bin) { return $bin.FullName }
+
+    return $null
+}
+
+function Read-Bytes {
+    param([string]$Path, [int]$Count = 4194304)
+    $fs = [System.IO.File]::OpenRead($Path)
+    $buffer = New-Object byte[] $Count
+    $fs.Read($buffer, 0, $Count) | Out-Null
+    $fs.Close()
+    return $buffer
+}
+
+function Detect-DVD {
+    param([byte[]]$Data)
+
+    for ($offset = 0x8000; $offset -le 0x50000; $offset += 0x800) {
+        if ($Data.Length -lt ($offset + 5)) { continue }
+
+        if ($Data[$offset] -eq 0x43 -and
+            $Data[$offset+1] -eq 0x44 -and
+            $Data[$offset+2] -eq 0x30 -and
+            $Data[$offset+3] -eq 0x30 -and
+            $Data[$offset+4] -eq 0x31) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Detect-UDF {
+    param([byte[]]$Data)
+
+    $patterns = @("NSR02", "NSR03")
+    $text = [System.Text.Encoding]::ASCII.GetString($Data)
+
+    foreach ($p in $patterns) {
+        if ($text.Contains($p)) { return $true }
+    }
+
+    return $false
+}
+
+function Detect-PS2CD {
+    param([byte[]]$Data)
+    $sync = @(0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00)
+    for ($i = 0; $i -lt 2000; $i++) {
+        $match = $true
+        for ($j = 0; $j -lt $sync.Length; $j++) {
+            if ($Data[$i+$j] -ne $sync[$j]) { $match = $false; break }
+        }
+        if ($match) { return $true }
+    }
+    return $false
+}
+
+function Detect-PSP {
+    param([byte[]]$Data)
+    $text = [System.Text.Encoding]::ASCII.GetString($Data)
+    return ($text.Contains("UMD_DATA.BIN") -or $text.Contains("PSP_GAME"))
+}
+
+function Detect-3DO {
+    param([byte[]]$Data)
+    $sig = [System.Text.Encoding]::ASCII.GetString($Data[0x3C..0x40])
+    return ($sig -like "*OPERA*")
+}
+
+function Get-SystemType {
+    param([string]$Path)
+
+    $ext = [System.IO.Path]::GetExtension($Path).ToLower()
+
+    if ($ext -eq ".cue") {
+        $cueText = Get-Content -LiteralPath $Path -Raw
+        $binName = $null
+
+        if ($cueText -match 'FILE\s+"([^"]+\.bin)"') {
+            $binName = $matches[1]
+        }
+
+        if (-not $binName) { return "PS1" }
+
+        $binPath = Join-Path (Split-Path $Path) $binName
+        if (-not (Test-Path $binPath)) { return "PS1" }
+
+        $data = Read-Bytes $binPath
+
+        if (Detect-3DO $data) { return "3DO" }
+        if (Detect-PSP $data) { return "PSP" }
+        if (Detect-UDF $data) { return "PS2DVD" }
+        if (Detect-DVD $data) { return "PS2DVD" }
+        if (Detect-PS2CD $data) { return "PS2CD" }
+
+        return "PS1"
+    }
+
+    if ($ext -eq ".gdi") { return "Dreamcast" }
+
+    if ($ext -eq ".iso") {
+        $data = Read-Bytes $Path
+
+        if (Detect-3DO $data) { return "3DO" }
+        if (Detect-PSP $data) { return "PSP" }
+        if (Detect-UDF $data) { return "PS2DVD" }
+        if (Detect-DVD $data) { return "PS2DVD" }
+        if (Detect-PS2CD $data) { return "PS2CD" }
+
+        return "UnknownISO"
+    }
+
+    if ($ext -eq ".bin") {
+        $data = Read-Bytes $Path
+
+        if (Detect-3DO $data) { return "3DO" }
+        if (Detect-PSP $data) { return "PSP" }
+        if (Detect-UDF $data) { return "PS2DVD" }
+        if (Detect-DVD $data) { return "PS2DVD" }
+        if (Detect-PS2CD $data) { return "PS2CD" }
+
+        return "PS1"
+    }
+
+    return "Unknown"
+}
+
+function Get-CHDCommand {
+    param([string]$System)
+    switch ($System) {
+        "PS1"       { "createcd" }
+        "PS2CD"     { "createcd" }
+        "PS2DVD"    { "createdvd" }
+        "PSP"       { "createdvd" }
+        "Dreamcast" { "createcd" }
+        "3DO"       { "create3do" }
+        default     { $null }
+    }
+}
+
+function Get-CHDInfo {
+    param([string]$ChdPath)
+
+    $info = & $Chdman info -i "$ChdPath" 2>$null
+    if (-not $info) { return $null }
+
+    $info = ($info | Out-String)
+
+    $sectorSize = 0
+
+    if ($info -match "Unit\s+Size:\s*([0-9,]+)\s*bytes") {
+        $sectorSize = [int]($matches[1] -replace ",","")
+    }
+    elseif ($info -match "unit\s+bytes:\s*([0-9]+)") {
+        $sectorSize = [int]$matches[1]
+    }
+    elseif ($info -match "hunk\s+bytes:\s*([0-9]+)") {
+        $sectorSize = [int]$matches[1]
+    }
+
+    $type = "Unknown"
+
+    if ($info -match "TYPE:MODE1" -or $info -match "TYPE:MODE2") {
+        $type = "CD"
+    }
+
+    if ($info -match "GD-ROM") { $type = "GD" }
+    if ($info -match "Opera") { $type = "3DO" }
+    if ($info -match "PSP") { $type = "PSP" }
+
+    if ($info -match "Metadata:\s*Tag='CHT2'") {
+        if ($sectorSize -eq 2048) { $type = "DVD" }
+        elseif ($sectorSize -eq 2352 -or $sectorSize -eq 2448) { $type = "CD" }
+    }
+
+    [PSCustomObject]@{
+        Raw        = $info
+        Type       = $type
+        SectorSize = $sectorSize
+    }
+}
+
+function Validate-CHDForSystem {
+    param([string]$ChdPath, [string]$System)
+    $info = Get-CHDInfo $ChdPath
+    if (-not $info) { return $false }
+
+    switch ($System) {
+        "PS2DVD" { return ($info.Type -eq "DVD" -and $info.SectorSize -eq 2048) }
+        "PS2CD"  { return ($info.Type -eq "CD"  -and $info.SectorSize -eq 2352) }
+        "PS1"    { return ($info.Type -eq "CD") }
+        "PSP"    { return ($info.Type -eq "DVD" -and $info.SectorSize -eq 2048) }
+        "Dreamcast" { return ($info.Type -eq "GD" -or $info.Type -eq "CD") }
+        "3DO"    { return ($info.Type -eq "3DO") }
+        default  { return $false }
+    }
+}
+
+function Process-Game {
+    param([string]$BasePath, [string]$BaseName)
+
+    $dir  = $BasePath
+    $name = $BaseName
+
+    $isoFile = Get-ChildItem -LiteralPath $dir -Filter "$name.iso" -ErrorAction SilentlyContinue
+    $cueFile = Get-ChildItem -LiteralPath $dir -Filter "$name.cue" -ErrorAction SilentlyContinue
+    $binFile = Get-ChildItem -LiteralPath $dir -Filter "$name.bin" -ErrorAction SilentlyContinue
+    $gdiFile = Get-ChildItem -LiteralPath $dir -Filter "$name.gdi" -ErrorAction SilentlyContinue
+    $chdFile = Get-ChildItem -LiteralPath $dir -Filter "$name.chd" -ErrorAction SilentlyContinue
+
+    Write-Host "`n=== Processing: $name ===" -ForegroundColor Cyan
+
+    $sourcePath = $null
+    $system     = $null
+
+    if ($cueFile) {
+        $sourcePath = $cueFile.FullName
+        $system = Get-SystemType $sourcePath
+        Write-Host "[SRC] Found CUE → System = $system" -ForegroundColor Gray
+    }
+    elseif ($gdiFile) {
+        $sourcePath = $gdiFile.FullName
+        $system = Get-SystemType $sourcePath
+        Write-Host "[SRC] Found GDI → System = $system" -ForegroundColor Gray
+    }
+    elseif ($isoFile) {
+        $sourcePath = $isoFile.FullName
+        $system = Get-SystemType $sourcePath
+        Write-Host "[SRC] Found ISO → System = $system" -ForegroundColor Gray
+    }
+
+    if (-not $chdFile) {
+        Write-Host "[NEW] No CHD found → Creating new CHD..." -ForegroundColor Yellow
+        $cmd = Get-CHDCommand $system
+
+        $outputChd = Join-Path $dir "$name.chd"
+
+        & $Chdman $cmd -i $sourcePath -o $outputChd
+
+        Write-Host "[DONE] CHD created." -ForegroundColor Green
+
+        [console]::beep(440,120)
+        [console]::beep(440,120)
+
+        $chdFile = Get-ChildItem -LiteralPath $dir -Filter "$name.chd"
+
+        if (-not (Test-Path $outputChd) -or (Get-Item $outputChd).Length -lt 10000) {
+            Write-Host "[ERR] CHD creation failed → NOT deleting ISO" -ForegroundColor Red
+            return
+        }
+
+        if ($cueFile) { Remove-Item -LiteralPath $cueFile.FullName -Force }
+        if ($binFile) { Remove-Item -LiteralPath $binFile.FullName -Force -ErrorAction SilentlyContinue }
+        if ($isoFile) { Remove-Item -LiteralPath $isoFile.FullName -Force }
+    }
+}
+
+# Startup beep
+[console]::beep(880,150)
+[console]::beep(988,150)
+[console]::beep(1046,200)
+
+Write-Host "Starting CHD conversion & repair..." -ForegroundColor Cyan
+
+$files = Get-ChildItem -File | Where-Object {
+    $_.Extension.ToLower() -in ".iso", ".cue", ".gdi", ".chd", ".zip", ".7z", ".rar"
+}
+
+$groups = $files | Group-Object { $_.BaseName }
+
+foreach ($group in $groups) {
+
+    $first = $group.Group[0]
+    $ext = $first.Extension.ToLower()
+
+    if ($ext -in ".zip", ".7z", ".rar") {
+
+        Write-Host "`n=== Processing Archive: $($first.Name) ===" -ForegroundColor Cyan
+
+        $currentDir = $first.DirectoryName
+
+        if (-not (Extract-Archive $first.FullName $currentDir)) {
+            Write-Host "[FAIL] Extraction failed → moving to FailedArchives..." -ForegroundColor Red
+            Move-Item -LiteralPath $first.FullName -Destination $FailedDir -Force
+            continue
+        }
+
+        $gamePath = Find-ExtractedGameFile $currentDir
+
+        if (-not $gamePath) {
+            Write-Host "[FAIL] No ISO/BIN/CUE found → moving archive to FailedArchives..." -ForegroundColor Red
+            Move-Item -LiteralPath $first.FullName -Destination $FailedDir -Force
+            continue
+        }
+
+        $base = [System.IO.Path]::GetFileNameWithoutExtension($gamePath)
+        $dir  = [System.IO.Path]::GetDirectoryName($gamePath)
+
+        Write-Host "[ARC] Found extracted game file: $gamePath" -ForegroundColor Cyan
+
+        Process-Game -BasePath $dir -BaseName $base
+
+        $chdPath = Join-Path $dir "$base.chd"
+
+        if (Test-Path $chdPath) {
+            Write-Host "[CLEAN] CHD created successfully → deleting archive..." -ForegroundColor DarkYellow
+            Remove-Item $first.FullName -Force
+        }
+        else {
+            Write-Host "[CLEAN] CHD not created → moving archive to FailedArchives." -ForegroundColor Yellow
+            Move-Item -LiteralPath $first.FullName -Destination $FailedDir -Force
+        }
+
+        continue
+    }
+
+    Process-Game -BasePath $first.DirectoryName -BaseName $group.Name
+}
+
+Write-Host "All conversions and repairs complete!" -ForegroundColor Cyan
+
+[console]::beep(1318,150)
+[console]::beep(1567,150)
+[console]::beep(2093,250)
+[console]::beep(1760,200)
+[console]::beep(2093,300)

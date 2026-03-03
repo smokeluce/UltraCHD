@@ -1,0 +1,40 @@
+# UltraCHD – Quick Start Guide
+
+UltraCHD is an automated tool for converting PS2 and PSP disc images into CHD format with safe,
+zero‑risk cleanup logic.
+
+## Requirements
+- PowerShell 7+
+- Windows 10/11
+- chdman.exe (from MAME or RetroArch)
+- 7za.exe (standalone console version)
+- A folder containing your game archives or disc images
+
+## Setup
+1. Place `UltraCHD.ps1`, `chdman.exe`, and `7za.exe` in the same directory.
+2. Open PowerShell 7 (pwsh).
+3. Navigate to the folder containing your game files.
+
+## Usage
+Run UltraCHD on the current directory:
+
+    ./UltraCHD.ps1
+
+UltraCHD will:
+- Detect archives (.zip, .7z, .rar)
+- Extract them safely
+- Detect PS2/PSP disc images
+- Convert them to CHD
+- Delete the archive ONLY if CHD creation succeeds
+
+## Safety Notes
+- No files are ever deleted unless a CHD exists.
+- Extraction failures stop the process immediately.
+- Existing extracted files are never overwritten.
+- Extracted files remain after CHD creation.
+
+## Recommended
+- Use Windows Terminal with Cascadia Mono for proper Unicode display.
+- Keep your library organized: one game per folder.
+
+UltraCHD is designed for batch processing — point it at a directory and let it work.
